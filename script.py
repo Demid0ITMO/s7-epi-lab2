@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
 """
-Create retroactive commits from a YouTrack work_items.csv export,
-then integrate into develop -> main -> release/1.0.
+Event-driven simulation:
+  - Process work items in chronological order.
+  - First work item for an issue  -> create branch feature/<ID> from current develop.
+  - Every work item               -> commit on that branch with correct author/date.
+  - Last work item for an issue   -> merge branch into develop (with that date).
+  - Finally: merge develop into main, then reset release/1.0 to main.
 
-Flow:
-  1. For each Issue ID: branch feature/<ID> from 'develop', replay
-     each Work Item as an empty commit with author/date/message, push.
-  2. Merge every feature branch into 'develop' (--no-ff), push.
-  3. Merge 'develop' into 'main' (--no-ff), push.
-  4. Reset 'release/1.0' to point at 'main', push.
+This makes each feature branch parent point = develop's state at the moment
+work started on that issue — i.e. branches naturally appear in time order.
 """
 
 import csv
 import os
 import subprocess
 import sys
-from collections import defaultdict
 from datetime import datetime
 
 # ---------- CONFIG ----------
 CSV_PATH       = "work_items.csv"
 BRANCH_PREFIX  = "feature/"
-BASE_BRANCH    = "develop"          # features branch FROM here
-INTEGRATION    = "develop"          # features merge INTO here
-MAIN_BRANCH    = "main"             # develop merges INTO here
-RELEASE_BRANCH = "release/1.0"      # created from MAIN_BRANCH
-EMAIL_DOMAIN   = "example.com"      # <-- CHANGE to your team's real domain
+BASE_BRANCH    = "develop"
+MAIN_BRANCH    = "main"
+RELEASE_BRANCH = "release/1.0"
+EMAIL_DOMAIN   = "example.com"      # <-- CHANGE to your real domain
 TZ_OFFSET      = "+03:00"
-DO_MERGE       = True               # set False to only create feature branches
-DRY_RUN        = True
+DRY_RUN        = False
+VERBOSE        = False              # set True to see each git invocation
 
 RU_MONTHS = {
     "янв": 1, "фев": 2, "февр": 2, "мар": 3, "апр": 4,
@@ -39,10 +37,7 @@ RU_MONTHS = {
 
 
 def parse_ru_date(s: str) -> datetime:
-    parts = s.strip().split()
-    if len(parts) != 4:
-        raise ValueError(f"unexpected date format: {s!r}")
-    day, mon_raw, year, tm = parts
+    day, mon_raw, year, tm = s.strip().split()
     key = mon_raw.rstrip(".").lower()
     if key not in RU_MONTHS:
         raise ValueError(f"unknown month: {mon_raw!r}")
@@ -50,8 +45,15 @@ def parse_ru_date(s: str) -> datetime:
     return datetime(int(year), RU_MONTHS[key], int(day), hh, mm)
 
 
-def run(cmd, env=None, check=True):
+def run(cmd, env=None, check=True, show=None):
+    if show is None:
+        show = VERBOSE
+    if show:
+        print(f"    $ {' '.join(cmd)}")
     r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if show and r.stdout.strip():
+        for line in r.stdout.strip().splitlines():
+            print(f"      {line}")
     if check and r.returncode != 0:
         print(f"FAILED: {' '.join(cmd)}", file=sys.stderr)
         print(r.stderr, file=sys.stderr)
@@ -59,21 +61,44 @@ def run(cmd, env=None, check=True):
     return r
 
 
+def rev_parse(ref: str) -> str:
+    return subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
+
+
 def iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + TZ_OFFSET
 
 
+def force_merge_commit(branch: str, message: str, env: dict) -> None:
+    """Merge `branch` into HEAD; force a merge commit if merge is a no-op."""
+    before = rev_parse("HEAD")
+    r = subprocess.run(
+        ["git", "merge", "--no-ff", "--no-edit", "-m", message, branch],
+        capture_output=True, text=True, env=env,
+    )
+    if rev_parse("HEAD") != before:
+        return
+    # Trees identical → merge was a no-op. Force commit-tree with 2 parents.
+    tree   = rev_parse(f"{branch}^{{tree}}")
+    target = rev_parse(branch)
+    sha = subprocess.check_output(
+        ["git", "commit-tree", tree, "-p", before, "-p", target, "-m", message],
+        env=env, text=True,
+    ).strip()
+    run(["git", "reset", "--hard", sha])
+
+
 def main():
-    # ---------- Load CSV ----------
+    # ---------- Load ----------
     rows = []
     with open(CSV_PATH, encoding="utf-8-sig", newline="") as f:
-        for r in csv.DictReader(f):
+        for idx, r in enumerate(csv.DictReader(f)):
             if not r.get("Issue ID") or not r.get("Author"):
                 continue
             try:
                 dt = parse_ru_date(r["Date"])
             except Exception as e:
-                print(f"  skip: {e}")
+                print(f"  skip row {idx}: {e}")
                 continue
             rows.append({
                 "author":  r["Author"].strip(),
@@ -82,118 +107,116 @@ def main():
                 "comment": (r.get("Comment") or "").strip(),
                 "issue":   r["Issue ID"].strip(),
                 "summary": (r.get("Issue Summary") or "").strip(),
+                "row":     idx,
             })
 
-    by_issue = defaultdict(list)
-    for row in rows:
-        by_issue[row["issue"]].append(row)
-    for v in by_issue.values():
-        v.sort(key=lambda x: x["date"])
-    issues = sorted(by_issue, key=lambda i: by_issue[i][0]["date"])
+    # Chronological events. Tie-break by issue id, then CSV row order.
+    events = sorted(rows, key=lambda e: (e["date"], e["issue"], e["row"]))
 
-    # ---------- Verify branches exist ----------
+    first_idx, last_idx = {}, {}
+    for i, ev in enumerate(events):
+        first_idx.setdefault(ev["issue"], i)
+        last_idx[ev["issue"]] = i
+
+    n_issues = len(first_idx)
+    print(f"Loaded {len(events)} work items across {n_issues} issues")
+    print(f"Timeline: {events[0]['date'].date()} → {events[-1]['date'].date()}\n")
+
+    # ---------- Verify branches ----------
     for b in (BASE_BRANCH, MAIN_BRANCH):
-        r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{b}"],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            sys.exit(f"Branch '{b}' not found locally.")
+        if subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{b}"],
+                          capture_output=True).returncode != 0:
+            sys.exit(f"Branch '{b}' not found.")
 
-    orig_branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
-    print(f"Original branch: {orig_branch}")
+    if subprocess.check_output(["git", "status", "--porcelain"], text=True).strip():
+        sys.exit("Working directory is dirty. Commit/stash changes first.")
 
-    # =================== PHASE 1: feature branches ===================
-    print(f"\n=== PHASE 1: create {len(issues)} feature branches from '{BASE_BRANCH}' ===")
-    pushed_features = []
+    orig = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                   text=True).strip()
 
-    for issue in issues:
-        branch = f"{BRANCH_PREFIX}{issue}"
-        items = by_issue[issue]
-        print(f"\n--- {issue} ({len(items)} work item(s)) -> {branch}")
+    branches_created = []
 
-        run(["git", "checkout", BASE_BRANCH])
-        run(["git", "checkout", "-B", branch])
+    # ---------- EVENT LOOP ----------
+    for i, ev in enumerate(events):
+        issue   = ev["issue"]
+        branch  = f"{BRANCH_PREFIX}{issue}"
+        is_first = first_idx[issue] == i
+        is_last  = last_idx[issue]  == i
+        date_s  = ev["date"].strftime("%Y-%m-%d")
+        hours   = ev["minutes"] / 60.0
+        h_str   = f"{int(hours)}h" if hours == int(hours) else f"{hours:.2f}h"
 
-        for row in items:
-            email = f"{row['author'].lower().replace(' ', '.')}@{EMAIL_DOMAIN}"
-            hours = row["minutes"] / 60.0
-            hours_str = f"{int(hours)}h" if hours == int(hours) else f"{hours:.2f}h"
-            desc = row["comment"] or row["summary"] or "work item"
-            msg = f"{issue}: {desc} ({hours_str})"
-            gdate = iso(row["date"])
+        flags = ("[create]" if is_first else "") + (" [close]" if is_last else "")
+        print(f"[{i+1:02d}/{len(events)}] {date_s} | {issue:<7} | {ev['author']:<10} | {h_str:<6} {flags}")
 
-            env = {
-                **os.environ,
-                "GIT_AUTHOR_NAME":     row["author"],
-                "GIT_AUTHOR_EMAIL":    email,
-                "GIT_COMMITTER_NAME":  row["author"],
-                "GIT_COMMITTER_EMAIL": email,
-                "GIT_AUTHOR_DATE":     gdate,
-                "GIT_COMMITTER_DATE":  gdate,
-            }
+        if is_first:
+            if not DRY_RUN:
+                run(["git", "checkout", BASE_BRANCH])
+                run(["git", "checkout", "-B", branch])
+                branches_created.append(branch)
+        else:
+            if not DRY_RUN:
+                run(["git", "checkout", branch])
 
+        email = f"{ev['author'].lower().replace(' ', '.')}@{EMAIL_DOMAIN}"
+        desc  = ev["comment"] or ev["summary"] or "work item"
+        msg   = f"{issue}: {desc} ({h_str})"
+        gdate = iso(ev["date"])
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME":     ev["author"],
+            "GIT_AUTHOR_EMAIL":    email,
+            "GIT_COMMITTER_NAME":  ev["author"],
+            "GIT_COMMITTER_EMAIL": email,
+            "GIT_AUTHOR_DATE":     gdate,
+            "GIT_COMMITTER_DATE":  gdate,
+        }
+
+        if DRY_RUN:
+            print(f"           → commit: {msg}")
+        else:
+            run(["git", "commit", "--allow-empty", "-m", msg], env=env)
+            print(f"           ✓ {msg}")
+
+        if is_last:
+            merge_msg = f"Merge branch '{branch}' into {BASE_BRANCH}"
             if DRY_RUN:
-                print(f"  [DRY] {gdate} | {row['author']:<10} | {msg}")
+                print(f"           → merge: {merge_msg}")
             else:
-                run(["git", "commit", "--allow-empty", "-m", msg], env=env)
-                print(f"  {gdate} | {row['author']:<10} | {msg}")
+                run(["git", "checkout", BASE_BRANCH])
+                force_merge_commit(branch, merge_msg, env)
+                print(f"           ✓ merged into {BASE_BRANCH}")
 
-        if not DRY_RUN:
-            r = run(["git", "push", "-u", "--force", "origin", branch], check=False)
-            if r.returncode == 0:
-                pushed_features.append(branch)
-                print(f"  pushed {branch}")
-            else:
-                print(f"  push failed: {r.stderr.strip()}")
-
-    # =================== PHASE 2: merge features into develop ===================
-    if DO_MERGE and not DRY_RUN:
-        print(f"\n=== PHASE 2: merge {len(issues)} feature branches into '{INTEGRATION}' ===")
-
-        # Make sure develop is up to date locally
-        run(["git", "checkout", INTEGRATION])
-        run(["git", "pull", "--ff-only"], check=False)
-
-        for i, issue in enumerate(issues, 1):
-            branch = f"{BRANCH_PREFIX}{issue}"
-            # Use the last commit's date so history looks chronological
-            last_date = iso(by_issue[issue][-1]["date"])
-            env = {**os.environ, "GIT_AUTHOR_DATE": last_date, "GIT_COMMITTER_DATE": last_date}
-            print(f"  [{i:02d}/{len(issues)}] merging {branch} ({last_date[:10]})")
-            run(["git", "merge", "--no-ff", branch,
-                 "-m", f"Merge branch '{branch}' into {INTEGRATION}"], env=env)
-
-        run(["git", "push", "-u", "origin", INTEGRATION])
-
-    # =================== PHASE 3: merge develop into main ===================
-    if DO_MERGE and not DRY_RUN:
-        print(f"\n=== PHASE 3: merge '{INTEGRATION}' into '{MAIN_BRANCH}' ===")
-
-        # Latest work item date = date of the release merge
-        latest_date = iso(max(row["date"] for row in rows))
+    # ---------- FINAL ----------
+    if not DRY_RUN:
+        print(f"\n=== FINAL: {BASE_BRANCH} → {MAIN_BRANCH} → {RELEASE_BRANCH} ===")
+        latest = iso(events[-1]["date"])
+        merge_env = {**os.environ,
+                     "GIT_AUTHOR_DATE": latest, "GIT_COMMITTER_DATE": latest}
 
         run(["git", "checkout", MAIN_BRANCH])
-        run(["git", "pull", "--ff-only"], check=False)
+        force_merge_commit(
+            BASE_BRANCH,
+            f"Merge branch '{BASE_BRANCH}' into {MAIN_BRANCH}",
+            merge_env,
+        )
+        print(f"    ✓ {BASE_BRANCH} merged into {MAIN_BRANCH}")
 
-        env = {**os.environ, "GIT_AUTHOR_DATE": latest_date, "GIT_COMMITTER_DATE": latest_date}
-        run(["git", "merge", "--no-ff", INTEGRATION,
-             "-m", f"Merge branch '{INTEGRATION}' into {MAIN_BRANCH}"], env=env)
-        run(["git", "push", "-u", "origin", MAIN_BRANCH])
-        print(f"  merged and pushed '{MAIN_BRANCH}'")
-
-    # =================== PHASE 4: create release from main ===================
-    if DO_MERGE and not DRY_RUN:
-        print(f"\n=== PHASE 4: create '{RELEASE_BRANCH}' from '{MAIN_BRANCH}' ===")
         run(["git", "checkout", "-B", RELEASE_BRANCH, MAIN_BRANCH])
-        run(["git", "push", "-u", "--force", "origin", RELEASE_BRANCH])
-        print(f"  created and pushed '{RELEASE_BRANCH}'")
+        print(f"    ✓ {RELEASE_BRANCH} points at {MAIN_BRANCH}")
 
-    # ---------- Return to original branch ----------
-    run(["git", "checkout", orig_branch])
+        print(f"\n=== PUSH ===")
+        for b in branches_created + [BASE_BRANCH, MAIN_BRANCH, RELEASE_BRANCH]:
+            run(["git", "push", "-u", "--force", "origin", b])
+            print(f"    ✓ pushed {b}")
+
+    run(["git", "checkout", orig])
 
     print(f"\n=== DONE ===")
-    print(f"Issues: {len(issues)} | Work items: {len(rows)} | Feature branches: {len(pushed_features)}")
-    if DO_MERGE and not DRY_RUN:
-        print(f"Merged into '{INTEGRATION}' -> '{MAIN_BRANCH}' -> '{RELEASE_BRANCH}'")
+    print(f"Issues: {n_issues} | Work items: {len(events)} | Feature branches: {len(branches_created)}\n")
+    print("Verify:")
+    print("  git log --graph --all --date-order --pretty=format:'%h %ad %an %s' --date=short | head -100")
+    print(f"  git rev-parse {MAIN_BRANCH} {RELEASE_BRANCH}   # same SHA")
 
 
 if __name__ == "__main__":
